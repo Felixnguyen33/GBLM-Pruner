@@ -1,3 +1,4 @@
+#prune.py
 import time 
 import heapq 
 import torch 
@@ -7,7 +8,7 @@ from .layerwrapper import WrappedGPT
 from .data import get_loaders 
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
-from transformers import AdamW
+from torch.optim import AdamW
 import numpy as np
 import matplotlib.pyplot as plt
 import gc
@@ -121,18 +122,22 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
     inps.requires_grad = False
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'attention_mask': None, "position_embeddings": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
+            # print(">>>> kwargs >>>>>>>>>")
+            # print(kwargs)
+            # print(">>>> kwargs >>>>>>>>>")
             inps[cache['i']] = inp
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
+    # Replace the first layer with Catcher to capture input
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
@@ -143,10 +148,10 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
     model.config.use_cache = use_cache
 
-    return inps, outs, attention_mask, position_ids 
+    return inps, outs, attention_mask, position_embeddings 
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     thres_cumsum = sum_before * alpha 
@@ -219,11 +224,11 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
     with open(args.gradient_path, 'rb') as file:
         gradients = torch.load(args.gradient_path, map_location=torch.device('cpu')) 
 
-    print("loading calibdation data")
+    print("loading calibration data")
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, device)
+        inps, outs, attention_mask, position_embeddings = prepare_calibration_input(model, dataloader, args.nsamples, device)
 
     layers = model.model.layers
     for i in range(len(layers)):
@@ -232,8 +237,16 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
 
         if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+            # Device transfer
+            inps = inps.to(dev)
+            outs = outs.to(dev)
+            if attention_mask is not None:
+                print("attention mask is not none, shape is: ", attention_mask.shape)
+                attention_mask = attention_mask.to(dev)
 
+            if position_embeddings is not None:
+                # position_embeddings = position_embeddings.to(dev)
+                position_embeddings = tuple(t.to(dev) for t in position_embeddings)
         wrapped_layers = {}
         for name in subset:
             wrapped_layers[name] = WrappedGPT(subset[name], layer_id=i, layer_name=name)
@@ -248,7 +261,7 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
             handles.append(subset[name].register_forward_hook(add_batch(name))) ## this is a important function.
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
 
         for h in handles:
             h.remove() 
@@ -304,7 +317,7 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=None, position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache 
@@ -315,11 +328,11 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
-    print("loading calibdation data")
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
+    print("loading calibration data")
+    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, device)
+        inps, outs, attention_mask, position_embeddings = prepare_calibration_input(model, dataloader, args.nsamples, device)
 
     layers = model.model.layers
 
@@ -329,7 +342,17 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
         if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+            # inps, outs, attention_mask, position_embeddings = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_embeddings.to(dev)
+            inps = inps.to(dev)
+            outs = outs.to(dev)
+            if attention_mask is not None:
+                print("attention mask is not none, shape is: ", attention_mask.shape)
+                attention_mask = attention_mask.to(dev)
+
+            if position_embeddings is not None:
+                # print("position_embeddings is not none, shape is:", position_embeddings.shape)
+                position_embeddings = tuple(t.to(dev) for t in position_embeddings)
+                # position_embeddings = position_embeddings.to(dev)
 
         wrapped_layers = {}
         for name in subset:
@@ -345,13 +368,12 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             handles.append(subset[name].register_forward_hook(add_batch(name))) ## this is a important function.
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
 
         for h in handles:
             h.remove() 
 
-        for sub_i, name in enumerate(subset):
-        
+        for name in subset:
             print(f"pruning layer {i} name {name}")
             W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
 
@@ -393,7 +415,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache 
@@ -417,7 +439,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'attention_mask': None, "position_embeddings": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -427,7 +449,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
             inps[cache['i']] = inp
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -440,7 +462,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
 
     print('Ready.')
 
@@ -449,7 +471,15 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
         if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
             print(f"layer {i} device {dev}")
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+            # Device transfer
+            inps = inps.to(dev)
+            outs = outs.to(dev)
+            if attention_mask is not None:
+                print("attention mask is not none, shape is: ", attention_mask.shape)
+                attention_mask = attention_mask.to(dev)
+            if position_embeddings is not None:
+                # position_embeddings = position_embeddings.to(dev)
+                position_embeddings = tuple(t.to(dev) for t in position_embeddings)
 
         subset = find_layers(layer)
 
@@ -467,7 +497,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
         for h in handles:
             h.remove()
 
@@ -479,7 +509,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
             gpts[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=None, position_embeddings=position_embeddings)[0]
 
         layers[i] = layer 
         torch.cuda.empty_cache()

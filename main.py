@@ -1,3 +1,4 @@
+#main.py
 import argparse
 import os 
 import numpy as np
@@ -19,7 +20,8 @@ def get_llm(model, cache_dir="llm_weights"):
         torch_dtype=torch.float16, 
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
-        device_map="auto"
+        device_map="auto",
+        trust_remote_code=True
     )
     print("printing gpu allocation for all the layers")
     print(model.hf_device_map)
@@ -39,7 +41,7 @@ def main():
     parser.add_argument('--layer_no', type=int, default=-1, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4"])
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt","gradient", "gblm"])
-    parser.add_argument("--cache_dir", default="llm_weights", type=str )
+    parser.add_argument("--cache_dir", default="./llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
@@ -63,7 +65,7 @@ def main():
     print(f"loading llm model {args.model}")
     model = get_llm(args.model, args.cache_dir)
     model.eval()
-    tokenizer = LlamaTokenizer.from_pretrained(args.model, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
     device = torch.device("cuda:0")
     if "30b" in args.model or "65b" in args.model or "70b" in args.model: 

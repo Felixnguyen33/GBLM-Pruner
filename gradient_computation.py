@@ -3,7 +3,8 @@ import torch
 import random
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaTokenizer
 from importlib.metadata import version
-from transformers import AdamW
+# from transformers import AdamW
+from torch.optim import AdamW
 from datasets import load_dataset
 import torch.nn as nn 
 from tqdm import tqdm
@@ -71,8 +72,8 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
 def get_c4(nsamples, seed, seqlen, tokenizer):
     # Load train and validation datasets
     print("trying to load allenai-c4 dataset........")
-    traindata = load_dataset('allenai/c4', 'allenai--c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train')
-    valdata = load_dataset('allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation')
+    traindata = load_dataset('allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train')
+    valdata = load_dataset('allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation')
 
     # Generate samples from training set
     random.seed(seed)
@@ -161,18 +162,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--nsamples', type=int, default=128, help='no of samples used')
     parser.add_argument('--scale', type=int, default=100, help='no of samples used')
-    parser.add_argument('--llama_version', type=int, default=2, help='llama version used')
+    parser.add_argument('--model_with_version', type=str, default=2, help='llama version used')
     parser.add_argument('--model', type=str, help='model to used') ## change
+    parser.add_argument('--cache_dir', type=str, default="./llm_weights", help='Cache dir') 
+    parser.add_argument('--gradient_path', type=str, default="./gradients", help='gradient path') 
     args = parser.parse_args()
     print(f"Obtaining gradients for no of samples {args.nsamples}, scale {args.scale}")
     
     model_args = args.model
-    cache_dir_args = "llm_weights"
+    cache_dir_args = args.cache_dir
     model = get_llm(model_args, cache_dir_args)
-    if args.llama_version == 2:
-        tokenizer = AutoTokenizer.from_pretrained(model_args, use_fast=False)
-    else:
-        tokenizer = LlamaTokenizer.from_pretrained(model_args, use_fast=False) ## change
+    tokenizer = AutoTokenizer.from_pretrained(model_args, use_fast=False)
+    # if args.llama_version == 2:
+    #     tokenizer = AutoTokenizer.from_pretrained(model_args, use_fast=False)
+    # else:
+    #     tokenizer = AutoTokenizer.from_pretrained(model_args, use_fast=False) ## change
 
 
     layers = model.model.layers 
@@ -208,9 +212,9 @@ if __name__ == "__main__":
         grad_sqrt = torch.sqrt(gradients_l2[name])
         gradients_l2[name] = grad_sqrt.to(dtype=torch.float16)
     model_name = os.path.basename(args.model)
-    if not os.path.exists(f'./gradients/llama{args.llama_version}'):
-        os.makedirs(f'./gradients/llama{args.llama_version}')
-    with open(f'./gradients/llama{args.llama_version}/gradients_aggregrate_norm_l2_model_{model_name}.pth', 'wb') as f:
+    if not os.path.exists(f'{args.gradient_path}/{args.model_with_version}'):
+        os.makedirs(f'{args.gradient_path}/{args.model_with_version}')
+    with open(f'{args.gradient_path}/{args.model_with_version}/gradients_aggregrate_norm_l2_model_{model_name}.pth', 'wb') as f:
         torch.save(gradients_l2, f)
-    with open(f'./gradients/llama{args.llama_version}/gradients_aggregrate_norm_l1_model_{model_name}.pth', 'wb') as f:
+    with open(f'{args.gradient_path}/{args.model_with_version}/gradients_aggregrate_norm_l1_model_{model_name}.pth', 'wb') as f:
         torch.save(grad_up.gradients_l1, f)
