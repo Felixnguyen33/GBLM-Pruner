@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import random
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaTokenizer
+from transformers import AutoModelForVision2Seq, AutoProcessor
 from importlib.metadata import version
 # from transformers import AdamW
 from torch.optim import AdamW
@@ -10,6 +11,8 @@ import torch.nn as nn
 from tqdm import tqdm
 import argparse
 import os
+from PIL import Image
+from lib.prune import get_lm_layers
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -91,11 +94,26 @@ def get_c4(nsamples, seed, seqlen, tokenizer):
         # tar[:, :-1] = -100
         trainloader.append((inp, tar))
 
-    # Prepare validation dataset
-    valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
+    # Prepare validation dataset - use model's max sequence length to avoid truncation warnings
+    valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt', max_length=seqlen, truncation=True)
     valenc = valenc.input_ids[:, :(256 * seqlen)]
     valenc = TokenizerWrapper(valenc)
     return trainloader, valenc
+
+# Load and process VQA dataset for vision-language models
+def get_vqa(nsamples, seed, seqlen, tokenizer):
+    dataset = load_dataset("Graphcore/vqa", split="validation[:200]")
+    random.seed(seed)
+    indices = random.sample(range(len(dataset)), min(nsamples, len(dataset)))
+    trainloader = []
+    for idx in indices:
+        item = dataset[idx]
+        image_path = item["image_id"]
+        question = item["question"]
+        image = Image.open(image_path)
+        question_enc = tokenizer(question, return_tensors="pt", padding="max_length", truncation=True, max_length=seqlen)
+        trainloader.append((image, question_enc))
+    return trainloader, None
 
 # Function to select the appropriate loader based on dataset name
 def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
@@ -103,19 +121,37 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
         return get_wikitext2(nsamples, seed, seqlen, tokenizer)
     if "c4" in name:
         return get_c4(nsamples, seed, seqlen, tokenizer)
+    if "qwen2.5-vl" in name.lower() or "vl" in name.lower():
+        return get_vqa(nsamples, seed, seqlen, tokenizer)
 
 def get_llm(model, cache_dir="llm_weights"):
-    model = AutoModelForCausalLM.from_pretrained(
-        model, 
-        torch_dtype=torch.float16, 
-        cache_dir=cache_dir, 
-        low_cpu_mem_usage=True, 
-        device_map="auto"
-    )
-    print("printing gpu allocation for all the layers")
-    print(model.hf_device_map)
-    model.seqlen = 2048
-    return model
+    if any(x in model.lower() for x in ["vl", "vision", "llava"]):
+        model = AutoModelForVision2Seq.from_pretrained(
+            model,
+            torch_dtype=torch.float16,
+            cache_dir=cache_dir,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        print("printing gpu allocation for all the layers (VLM)")
+        print(model.hf_device_map)
+        # Set sequence length based on model's max position embeddings or config
+        model.seqlen = getattr(model.config, 'max_position_embeddings', 4096)
+        return model
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model, 
+            torch_dtype=torch.float16, 
+            cache_dir=cache_dir, 
+            low_cpu_mem_usage=True, 
+            device_map="auto"
+        )
+        print("printing gpu allocation for all the layers")
+        print(model.hf_device_map)
+        # Set sequence length based on model's max position embeddings or config
+        model.seqlen = getattr(model.config, 'max_position_embeddings', 2048)
+        return model
 
 class gradient_computation:
     def __init__(self, model, scale):
@@ -128,7 +164,7 @@ class gradient_computation:
         self.gradients_init()
 
     def gradients_init(self):
-        layers = self.model.model.layers
+        layers = get_lm_layers(self.model)
         for i in tqdm(range(len(layers)), desc=f"initializing the gradient list ...."):
             layer = layers[i]
             subset = find_layers(layer)
@@ -139,7 +175,7 @@ class gradient_computation:
     
     def update_gradient(self, model, nsample):
         assert nsample - self.nsample == 1, "number of samples must be incremented by 1"
-        layers = model.model.layers
+        layers = get_lm_layers(model)
         for i in tqdm(range(len(layers)), desc=f"updating the gradient of sample no: {self.nsample}"):
             layer = layers[i]
             subset = find_layers(layer)
@@ -179,14 +215,25 @@ if __name__ == "__main__":
     #     tokenizer = AutoTokenizer.from_pretrained(model_args, use_fast=False) ## change
 
 
-    layers = model.model.layers 
+    # Support both LLMs and VLMs (which have a language_model submodule)
+    layers = get_lm_layers(model)
     # device=torch.device("cuda:0")
+    print("Available keys in model.hf_device_map:", list(model.hf_device_map.keys()))
     if "model.embed_tokens" in model.hf_device_map:
         device = model.hf_device_map["model.embed_tokens"]
+    else:
+        # Fallback: use the first available device or default to cuda:0
+        if model.hf_device_map:
+            device = list(model.hf_device_map.values())[0]
+        else:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     print("loading calibdation data")
     nsamples=args.nsamples
     seed=0
-    dataloader, _ = get_loaders("c4",nsamples=nsamples,seed=seed,seqlen=2048,tokenizer=tokenizer)
+    # Use the model's actual sequence length instead of hardcoding 2048
+    seqlen = getattr(model, 'seqlen', 2048)
+    dataloader, _ = get_loaders("c4",nsamples=nsamples,seed=seed,seqlen=seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     optimizer = AdamW(model.parameters(), lr=0.01, eps=0.01)
     optimizer.zero_grad()

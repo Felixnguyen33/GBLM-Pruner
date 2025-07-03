@@ -1,9 +1,8 @@
-#main.py
 import argparse
 import os 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaTokenizer, AutoModelForVision2Seq, AutoProcessor
 from importlib.metadata import version
 
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, check_sparsity, find_layers, prune_gradient, prune_gblm
@@ -15,6 +14,40 @@ print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
 def get_llm(model, cache_dir="llm_weights"):
+    # Add Llava support
+    if "llava" in model.lower():
+        try:
+            from transformers import LlavaForConditionalGeneration
+        except ImportError:
+            raise ImportError("You need transformers >= 4.35.3 for Llava support. Please upgrade your transformers package.")
+        llava_model = LlavaForConditionalGeneration.from_pretrained(
+            model,
+            torch_dtype=torch.float16,
+            cache_dir=cache_dir,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        print("printing gpu allocation for all the layers (Llava)")
+        print(llava_model.hf_device_map)
+        llava_model.seqlen = 2048
+        return llava_model, None
+    # Add VLM support
+    if "qwen2.5-vl" in model.lower() or "vl" in model.lower():
+        vlm_model = AutoModelForVision2Seq.from_pretrained(
+            model,
+            torch_dtype=torch.float16,
+            cache_dir=cache_dir,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        print("printing gpu allocation for all the layers (VLM)")
+        print(vlm_model.hf_device_map)
+        vlm_model.seqlen = 2048
+        vlm_processor = AutoProcessor.from_pretrained(model, trust_remote_code=True, cache_dir=cache_dir)
+        return vlm_model, vlm_processor
+    # Default: text-only model
     model = AutoModelForCausalLM.from_pretrained(
         model, 
         torch_dtype=torch.float16, 
@@ -26,8 +59,7 @@ def get_llm(model, cache_dir="llm_weights"):
     print("printing gpu allocation for all the layers")
     print(model.hf_device_map)
     model.seqlen = 2048
-
-    return model
+    return model, None
 
 def main():
     parser = argparse.ArgumentParser()
@@ -63,9 +95,29 @@ def main():
 
     model_name = args.model.split("/")[-1]
     print(f"loading llm model {args.model}")
-    model = get_llm(args.model, args.cache_dir)
+    model, processor = get_llm(args.model, args.cache_dir)
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    # Use processor for VLM, tokenizer for text models
+    if processor is not None:
+        # For VLMs, get the text tokenizer for the language model part
+        try:
+            # Qwen2.5-VL uses a subfolder for the language model
+            text_tokenizer = AutoTokenizer.from_pretrained(
+                os.path.join(args.model, "language_model"), use_fast=False
+            )
+        except Exception:
+            # Fallback: try loading from the base model
+            text_tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+        tokenizer = text_tokenizer
+    else:
+        # Patch: For LLaVA, use LlamaTokenizer (or AutoTokenizer fallback)
+        if "llava" in args.model.lower():
+            try:
+                tokenizer = LlamaTokenizer.from_pretrained(args.model, use_fast=False)
+            except Exception:
+                tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
     device = torch.device("cuda:0")
     if "30b" in args.model or "65b" in args.model or "70b" in args.model: 
@@ -74,6 +126,10 @@ def main():
 
     idx = args.layer_no
     print(f"pruning for sparsity_ratio {args.sparsity_ratio} by method {args.prune_method}")
+    # Choose calibration dataset based on model type
+    dataset_name = "c4"
+    if "qwen2.5-vl" in args.model.lower() or "vl" in args.model.lower():
+        dataset_name = "qwen2.5-vl"
     if args.sparsity_ratio != 0:
         print("pruning starts")
         if args.prune_method == "wanda":

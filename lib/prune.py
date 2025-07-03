@@ -17,6 +17,23 @@ import os
 
 from pdb import set_trace as st 
 
+def get_hidden_size(model):
+    """
+    Get the hidden size from different model configurations.
+    Handles various model architectures including LLaVA, Qwen, etc.
+    """
+    # For LLaVA and similar VLMs
+    if hasattr(model, "language_model") and hasattr(model.language_model, "config"):
+        return model.language_model.config.hidden_size
+    # For standard LLMs
+    elif hasattr(model, "config") and hasattr(model.config, "hidden_size"):
+        return model.config.hidden_size
+    # For models with model.config
+    elif hasattr(model, "model") and hasattr(model.model, "config") and hasattr(model.model.config, "hidden_size"):
+        return model.model.config.hidden_size
+    else:
+        raise AttributeError("Cannot find hidden_size in the model configuration.")
+
 def no_zero(data):
     zero_count = (data == 0).sum().item()
     return zero_count
@@ -85,10 +102,10 @@ def find_layers(module, layers=[nn.Linear], name=''):
     return res
 
 def check_sparsity(model, args):
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
+    use_cache = getattr(model.config, "use_cache", False)
+    setattr(model.config, "use_cache", False)
 
-    layers = model.model.layers
+    layers = get_lm_layers(model)
     count = 0 
     total_params = 0
     for i in range(len(layers)):
@@ -107,20 +124,30 @@ def check_sparsity(model, args):
 
         print(f"layer {i} sparsity {float(sub_count)/sub_params:.6f}")
 
-    model.config.use_cache = use_cache 
+    setattr(model.config, "use_cache", use_cache)
     return float(count)/total_params 
 
 def prepare_calibration_input(model, dataloader, nsamples, device):
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
+    use_cache = getattr(model.config, "use_cache", False)
+    setattr(model.config, "use_cache", False)
+    layers = get_lm_layers(model)
 
-    # dev = model.hf_device_map["model.embed_tokens"]
-    if "model.embed_tokens" in model.hf_device_map:
-        device = model.hf_device_map["model.embed_tokens"]
+    # Determine the device for embedding tokens for different model structures
+    if hasattr(model, 'hf_device_map'):
+        # Try different possible device map keys for embedding layer
+        possible_embed_keys = [
+            "model.language_model.embed_tokens",  # For Qwen2.5-VL and similar VLMs
+            "model.embed_tokens",  # For standard LLMs
+            "model.language_model.model.embed_tokens"  # For LLaVA-style models
+        ]
+        for key in possible_embed_keys:
+            if key in model.hf_device_map:
+                device = model.hf_device_map[key]
+                break
 
     dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
+    hidden_size = get_hidden_size(model)
+    inps = torch.zeros((nsamples, model.seqlen, hidden_size), dtype=dtype, device=device)
     inps.requires_grad = False
     cache = {'i': 0, 'attention_mask': None, "position_embeddings": None}
 
@@ -128,6 +155,13 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
         def __init__(self, module):
             super().__init__()
             self.module = module
+        
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.module, name)
+        
         def forward(self, inp, **kwargs):
             # print(">>>> kwargs >>>>>>>>>")
             # print(kwargs)
@@ -149,7 +183,7 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_embeddings = cache['position_embeddings']
-    model.config.use_cache = use_cache
+    setattr(model.config, "use_cache", use_cache)
 
     return inps, outs, attention_mask, position_embeddings 
 
@@ -162,7 +196,7 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     return W_mask, cur_sparsity
 
 def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, layer_no=-1):
-    layers = model.model.layers 
+    layers = get_lm_layers(model)
 
     for i in range(len(layers)):
         layer = layers[i]
@@ -186,7 +220,7 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
 def prune_gradient(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, layer_no=-1):
 
-    layers = model.model.layers
+    layers = get_lm_layers(model)
     with open(args.gradient_path, 'rb') as file:
         gradients = torch.load(args.gradient_path, map_location=torch.device('cpu')) 
     
@@ -219,8 +253,8 @@ def prune_gradient(args, model, tokenizer, device=torch.device("cuda:0"), prune_
 
 
 def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, layer_no=-1):
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
+    use_cache = getattr(model.config, "use_cache", False)
+    setattr(model.config, "use_cache", False)
     with open(args.gradient_path, 'rb') as file:
         gradients = torch.load(args.gradient_path, map_location=torch.device('cpu')) 
 
@@ -230,13 +264,27 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
     with torch.no_grad():
         inps, outs, attention_mask, position_embeddings = prepare_calibration_input(model, dataloader, args.nsamples, device)
 
-    layers = model.model.layers
+    layers = get_lm_layers(model)
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
-            dev = model.hf_device_map[f"model.layers.{i}"]
+        # Handle device mapping for different model structures
+        layer_device_key = None
+        if hasattr(model, 'hf_device_map'):
+            # Try different possible device map keys
+            possible_keys = [
+                f"model.language_model.layers.{i}",  # For Qwen2.5-VL and similar VLMs
+                f"model.layers.{i}",  # For standard LLMs
+                f"model.language_model.model.layers.{i}"  # For LLaVA-style models
+            ]
+            for key in possible_keys:
+                if key in model.hf_device_map:
+                    layer_device_key = key
+                    break
+        
+        if layer_device_key:
+            dev = model.hf_device_map[layer_device_key]
             # Device transfer
             inps = inps.to(dev)
             outs = outs.to(dev)
@@ -320,13 +368,13 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=None, position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
-    model.config.use_cache = use_cache 
+    setattr(model.config, "use_cache", use_cache)
     torch.cuda.empty_cache()
 
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, layer_no=-1):
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
+    use_cache = getattr(model.config, "use_cache", False)
+    setattr(model.config, "use_cache", False)
 
     print("loading calibration data")
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
@@ -334,7 +382,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     with torch.no_grad():
         inps, outs, attention_mask, position_embeddings = prepare_calibration_input(model, dataloader, args.nsamples, device)
 
-    layers = model.model.layers
+    layers = get_lm_layers(model)
 
     for i in range(len(layers)):
         layer = layers[i]
@@ -418,26 +466,38 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
-    model.config.use_cache = use_cache 
+    setattr(model.config, "use_cache", use_cache)
     torch.cuda.empty_cache()
 
 
 @torch.no_grad()
-def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=-1):
+def prune_sparsegpt(args, model, tokenizer, device, prune_n=0, prune_m=0, layer_no=-1):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
 
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
+    use_cache = getattr(model.config, "use_cache", False)
+    setattr(model.config, "use_cache", False)
+    layers = get_lm_layers(model)
 
-    if "model.embed_tokens" in model.hf_device_map:
-        dev = model.hf_device_map["model.embed_tokens"]
+    # Determine the initial device for input preparation
+    initial_dev = device
+    if hasattr(model, 'hf_device_map'):
+        # Try different possible device map keys for embedding layer
+        possible_embed_keys = [
+            "model.language_model.embed_tokens",  # For Qwen2.5-VL and similar VLMs
+            "model.embed_tokens",  # For standard LLMs
+            "model.language_model.model.embed_tokens"  # For LLaVA-style models
+        ]
+        for key in possible_embed_keys:
+            if key in model.hf_device_map:
+                initial_dev = model.hf_device_map[key]
+                break
 
     dtype = next(iter(model.parameters())).dtype
+    hidden_size = get_hidden_size(model)
     inps = torch.zeros(
-        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+        (args.nsamples, model.seqlen, hidden_size), dtype=dtype, device=initial_dev
     )
     cache = {'i': 0, 'attention_mask': None, "position_embeddings": None}
 
@@ -445,6 +505,13 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
         def __init__(self, module):
             super().__init__()
             self.module = module
+        
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.module, name)
+        
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
@@ -454,11 +521,11 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(dev))
+            model(batch[0].to(initial_dev))
         except ValueError:
             pass
     layers[0] = layers[0].module
-    torch.cuda.empty_cache()
+    setattr(model.config, "use_cache", use_cache)
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -468,18 +535,33 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
 
     for i in range(len(layers)):
         layer = layers[i]
-        if f"model.layers.{i}" in model.hf_device_map:
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            print(f"layer {i} device {dev}")
+        # Determine the device for this layer
+        layer_device_key = None
+        if hasattr(model, 'hf_device_map'):
+            # Try different possible device map keys
+            possible_keys = [
+                f"model.language_model.layers.{i}",  # For Qwen2.5-VL and similar VLMs
+                f"model.layers.{i}",  # For standard LLMs
+                f"model.language_model.model.layers.{i}"  # For LLaVA-style models
+            ]
+            for key in possible_keys:
+                if key in model.hf_device_map:
+                    layer_device_key = key
+                    break
+        
+        if layer_device_key:
+            layer_dev = model.hf_device_map[layer_device_key]
+            print(f"layer {i} device {layer_dev}")
             # Device transfer
-            inps = inps.to(dev)
-            outs = outs.to(dev)
+            inps = inps.to(layer_dev)
+            outs = outs.to(layer_dev)
             if attention_mask is not None:
                 print("attention mask is not none, shape is: ", attention_mask.shape)
-                attention_mask = attention_mask.to(dev)
+                attention_mask = attention_mask.to(layer_dev)
             if position_embeddings is not None:
-                # position_embeddings = position_embeddings.to(dev)
-                position_embeddings = tuple(t.to(dev) for t in position_embeddings)
+                position_embeddings = tuple(t.to(layer_dev) for t in position_embeddings)
+        else:
+            layer_dev = device
 
         subset = find_layers(layer)
 
@@ -512,9 +594,23 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=None, position_embeddings=position_embeddings)[0]
 
         layers[i] = layer 
+        setattr(model.config, "use_cache", use_cache)
         torch.cuda.empty_cache()
 
         inps, outs = outs, inps
 
-    model.config.use_cache = use_cache
+    setattr(model.config, "use_cache", use_cache)
     torch.cuda.empty_cache()
+
+def get_lm_layers(model):
+    # For LLaVA and similar VLMs with language_model.model.layers structure
+    if hasattr(model, "language_model") and hasattr(model.language_model, "model") and hasattr(model.language_model.model, "layers"):
+        return model.language_model.model.layers
+    # For Qwen2.5-VL and similar VLMs with language_model.layers structure
+    elif hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
+        return model.language_model.layers
+    # For standard LLMs
+    elif hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers
+    else:
+        raise AttributeError("Cannot find language model layers in the model.")
